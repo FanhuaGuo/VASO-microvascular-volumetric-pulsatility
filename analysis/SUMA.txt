@@ -1,0 +1,705 @@
+#############################################################################
+#########=================connect afni and suma===================###########
+#############################################################################
+subj=S01
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/SUMA'
+cd ${input_dir}/${subj}
+@SUMA_Make_Spec_FS -sid ${subj} 
+cd ${input_dir}/${subj}/s1
+mripy_create_hd_mesh.ipy -i ../SUMA -o ../SUMAhd -p 2 -j 6
+
+mripy_align_S2E.ipy -b T1_al.nii  -s ../SUMAhd  -o ${subj}_SurfVol_Alnd_Exp.nii
+
+3dresample  -dxyz 0.5 0.5 0.5   -rmode Cu  -prefix rVASO_mean.nii  -input VASO_mean.nii  -overwrite
+3dresample  -master rVASO_mean.nii   -rmode Cu  -prefix T1.resample.nii  -input T1_al.nii  -overwrite
+
+##===calculate the depth: depth 0->1 = deep->superficial
+mripy_compute_depth.ipy -b rVASO_mean.nii  -s ../SUMAhd -v ${subj}_SurfVol_Alnd_Exp.nii -l L14
+
+
+##===get ACA/MCA/PCA mask
+3dcalc -prefix tempACA.nii -a ../../../reference/VascularTerritoriesTemplate/mni_vascular_territories.nii.gz -expr 'step(a-1.9)*step(2.1-a)+step(a-11.9)*step(12.1-a)' -overwrite
+3dcalc -prefix tempMCA.nii -a ../../../reference/VascularTerritoriesTemplate/mni_vascular_territories.nii.gz -expr 'step(a-3.9)*step(4.1-a)+step(a-13.9)*step(14.1-a)' -overwrite
+3dcalc -prefix tempPCA.nii -a ../../../reference/VascularTerritoriesTemplate/mni_vascular_territories.nii.gz -expr 'step(a-5.9)*step(6.1-a)+step(a-15.9)*step(16.1-a)' -overwrite
+for vascularM in ACA MCA PCA ; do
+	3dNwarpApply -master rVASO_mean.nii \
+				-source temp${vascularM}.nii \
+				-interp wsinc5 \
+				-iwarp -nwarp "T1warp_whole_1Warp.nii.gz antsAffine_whole.1D" \
+				-prefix temp.nii -overwrite
+	3dcalc -prefix rMask.${vascularM}.nii -a temp.nii -expr 'step(a-0.5)' -overwrite
+	rm -f temp.nii
+	rm -f temp${vascularM}.nii
+done
+wait
+3dcalc -prefix rMask.whole.nii -a rVASO_mean.nii -expr '1' -overwrite
+
+
+##===load the Atlas
+for hemi in lh rh ; do
+	3dSurf2Vol  -spec ../SUMA/std.141.${subj}_${hemi}.spec \
+				-surf_A std.141.${hemi}.smoothwm.asc \
+				-surf_B std.141.${hemi}.pial.asc \
+				-sv  ${subj}_SurfVol_Alnd_Exp.nii  \
+				-gridparent  VASO_mean.nii  \
+				-map_func max  \
+				-f_index points  \
+				-f_steps 10      \
+				-f_p1_fr -0.4 -f_pn_fr 0.4   \
+				-sdata ../../std.141.HCP-MMP1.${hemi}.HCP-MMP1.annot.niml.dset   \
+				-prefix Mask.${hemi}.HCP-MMP1.annot.nii   \
+				-overwrite
+done
+3dcalc -prefix Mask.HCP-MMP1.annot.nii -a Mask.lh.HCP-MMP1.annot.nii -b Mask.rh.HCP-MMP1.annot.nii -expr 'step(-a+0.1)*step(b)*b+step(-b+0.1)*step(a)*a' -overwrite
+rm -f Mask.*.HCP-MMP1.annot.nii
+3dresample  -master rVASO_mean.nii   -rmode NN  -prefix rMask.HCP-MMP1.annot.nii  -input Mask.HCP-MMP1.annot.nii  -overwrite
+
+##===Remove several slices at the upper and lower edges to prevent other potential factors from affecting the signals.
+3dcalc -prefix rMask.HCP-MMP1.annot.nii -a rMask.HCP-MMP1.annot.nii -expr 'a*step(66-z)*step(z-49)' -overwrite
+
+
+
+##===segment the WM
+3dresample  -master rVASO_mean.nii   -rmode NN  -prefix rsegment.nii  -input segment.nii  -overwrite
+3dcalc -prefix rWM.nii -a rsegment.nii -expr 'step(a-2.8)' -overwrite
+3dcalc -prefix rWM.nii -a rWM.nii -b rVASO_mean.depth.nii -expr 'step(a)*step(0.001-b)' -overwrite
+# Check and remove incorrect clusters in AFNI GUI, then save as file 'rWMc_mask+orig'
+
+3dAFNItoNIFTI -prefix rWMc  rWMc_mask+orig. -overwrite
+# Since segmentation cannot distinguish subcortical nuclei well (such as putamen) with white matter, use the mask on the MNI template to remove subcortical nuclei and brainstem areas
+3dcalc -prefix tempCortex.nii -a ../../../reference/VascularTerritoriesTemplate/cortex_mask.nii -expr 'step(a)' -overwrite
+3dNwarpApply -master rVASO_mean.nii \
+			-source tempCortex.nii \
+			-interp wsinc5 \
+			-iwarp -nwarp "T1warp_whole_1Warp.nii.gz antsAffine_whole.1D" \
+			-prefix Cortex_mask.nii -overwrite
+3dcalc -prefix Cortex_mask.nii -a Cortex_mask.nii -expr 'step(a-0.5)' -overwrite
+rm -f tempCortex.nii
+
+3dcalc -prefix rMask.WMs.nii -a rWMc.nii -b rMask.HCP-MMP1.annot.nii -c Cortex_mask.nii -expr 'step(a)*step(b)*step(c)' -overwrite
+3dcalc -prefix rMask.WMd.nii -a rWMc.nii -b rMask.HCP-MMP1.annot.nii -c Cortex_mask.nii -expr 'step(a)*step(0.1-b)*step(c)' -overwrite
+3dcalc -prefix rMask.GMCSF.nii -a rVASO_mean.depth.nii -expr 'step(a)' -overwrite
+
+
+##===Remove several slices at the upper and lower edges to prevent other potential factors from affecting the signals.
+3dcalc -prefix rMask.WMd.nii -a rMask.WMd.nii -expr 'a*step(66-z)*step(z-49)' -overwrite
+3dcalc -prefix rMask.GMCSF.nii -a rMask.GMCSF.nii -expr 'a*step(66-z)*step(z-49)' -overwrite
+
+
+
+
+#############################################################################
+#########==================dump data to matlab====================###########
+#############################################################################
+##===dump combine-phase data to matlab analysis code for computing the mvPI
+regions=('WMd' 'WMs' 'GMCSF')
+analysis_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis'
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/SUMA'
+output_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis/group'
+subjs=('S01' 'S02')
+suffix='combphase'
+# whichRegion='whole'
+whichRegions=('whole' 'ACA' 'MCA' 'PCA')
+ss=''
+runs=(`count -digits 2 1 2`)
+session=1
+for subj in ${subjs[@]} ; do
+	cd ${input_dir}/${subj}/s${session}
+	mkdir ${output_dir}/${subj}
+	rm -f temp.1D
+	for whichRegion in ${whichRegions[@]} ; do
+		for run in ${runs[@]} ; do
+			for region in ${regions[@]} ; do
+				3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rVASO.nii  -input ${analysis_dir}/${subj}s${session}/VASO${ss}${run}.${suffix}.nii  -overwrite
+				3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rBOLD.nii  -input ${analysis_dir}/${subj}s${session}/BOLD${ss}${run}.${suffix}.nii  -overwrite
+				
+				3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+				3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rVASO.nii -overwrite
+				cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.VASO${ss}${run}.s${session}.TS.${whichRegion}.1D
+				rm -f temp.1D
+				3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rBOLD.nii -overwrite
+				cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.BOLD${ss}${run}.s${session}.TS.${whichRegion}.1D
+				rm -f temp.1D
+
+				rm -f rVASO.nii
+				rm -f rBOLD.nii
+
+				3dmaskdump -xyz -o temp.1D -mask tempROI.nii -noijk rVASO${ss}_mean.depth.nii -overwrite
+				cp  temp.1D  ${output_dir}/${subj}/depth.rROI${ss}.${region}.s${session}.${whichRegion}.1D
+				rm -f temp.1D
+				rm -f tempROI.nii
+			done
+			wait
+
+			rm -f ${output_dir}/${subj}/depth.rROI${ss}.WMd.s${session}.${whichRegion}.1D
+			rm -f ${output_dir}/${subj}/depth.rROI${ss}.WMs.s${session}.${whichRegion}.1D
+		done
+		wait
+	done
+done
+
+
+##===dump smooth combPhase data for drawing the mvPI maps
+regions=('WMd' 'WMs' 'GMCSF')
+analysis_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis'
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/SUMA'
+output_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis/group'
+subjs=('S01' 'S02')
+suffix='combphase'
+# whichRegion='whole'
+whichRegions=('whole')
+ss=''
+runs=(`count -digits 2 1 2`)
+session=1
+for subj in ${subjs[@]} ; do
+	cd ${input_dir}/${subj}/s${session}
+	mkdir ${output_dir}/${subj}
+	rm -f temp.1D
+	for whichRegion in ${whichRegions[@]} ; do
+		for run in ${runs[@]} ; do
+			# WMd
+			region='WMd'
+			3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rVASO.nii  -input ${analysis_dir}/${subj}s${session}/VASO${ss}${run}.${suffix}.nii  -overwrite
+			3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rBOLD.nii  -input ${analysis_dir}/${subj}s${session}/BOLD${ss}${run}.${suffix}.nii  -overwrite
+
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOs.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDs.nii -overwrite 
+
+			3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rVASOs.nii -overwrite
+			cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.VASO${ss}${run}.s${session}.TS.smooth.1D
+			rm -f temp.1D
+			3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rBOLDs.nii -overwrite
+			cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.BOLD${ss}${run}.s${session}.TS.smooth.1D
+			rm -f temp.1D
+
+			rm -f rVASO.nii
+			rm -f rBOLD.nii
+			rm -f rVASOs.nii
+			rm -f rBOLDs.nii
+			rm -f temp.1D
+			rm -f tempROI.nii
+
+			# WMs
+			region='WMs'
+			3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rVASO.nii  -input ${analysis_dir}/${subj}s${session}/VASO${ss}${run}.${suffix}.nii  -overwrite
+			3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rBOLD.nii  -input ${analysis_dir}/${subj}s${session}/BOLD${ss}${run}.${suffix}.nii  -overwrite
+
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOs.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDs.nii -overwrite 
+
+			3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rVASOs.nii -overwrite
+			cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.VASO${ss}${run}.s${session}.TS.smooth.1D
+			rm -f temp.1D
+			3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rBOLDs.nii -overwrite
+			cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.BOLD${ss}${run}.s${session}.TS.smooth.1D
+			rm -f temp.1D
+
+			rm -f rVASO.nii
+			rm -f rBOLD.nii
+			rm -f rVASOs.nii
+			rm -f rBOLDs.nii
+			rm -f temp.1D
+			rm -f tempROI.nii
+
+			# GMCSF
+			region='GMCSF'
+			3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rVASO.nii  -input ${analysis_dir}/${subj}s${session}/VASO${ss}${run}.${suffix}.nii  -overwrite
+			3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rBOLD.nii  -input ${analysis_dir}/${subj}s${session}/BOLD${ss}${run}.${suffix}.nii  -overwrite
+			3dcalc -prefix rVASOs.nii -a rVASO.nii -expr 'a*0' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLD.nii -expr 'a*0' -overwrite
+
+			depth=1
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b)*step(0.167-b)*step(c)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOt.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDt.nii -overwrite 
+			3dcalc -prefix rVASOs.nii -a rVASOs.nii -b rVASOt.nii -expr 'a+b' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLDs.nii -b rBOLDt.nii -expr 'a+b' -overwrite
+			rm -f tempROI.nii
+			rm -f rVASOt.nii
+			rm -f rBOLDt.nii
+
+			depth=2
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.167)*step(0.333-b)*step(c)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOt.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDt.nii -overwrite 
+			3dcalc -prefix rVASOs.nii -a rVASOs.nii -b rVASOt.nii -expr 'a+b' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLDs.nii -b rBOLDt.nii -expr 'a+b' -overwrite
+			rm -f tempROI.nii
+			rm -f rVASOt.nii
+			rm -f rBOLDt.nii
+
+			depth=3
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.333)*step(0.5-b)*step(c)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOt.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDt.nii -overwrite 
+			3dcalc -prefix rVASOs.nii -a rVASOs.nii -b rVASOt.nii -expr 'a+b' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLDs.nii -b rBOLDt.nii -expr 'a+b' -overwrite
+			rm -f tempROI.nii
+			rm -f rVASOt.nii
+			rm -f rBOLDt.nii
+
+			depth=4
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.5)*step(0.667-b)*step(c)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOt.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDt.nii -overwrite 
+			3dcalc -prefix rVASOs.nii -a rVASOs.nii -b rVASOt.nii -expr 'a+b' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLDs.nii -b rBOLDt.nii -expr 'a+b' -overwrite
+			rm -f tempROI.nii
+			rm -f rVASOt.nii
+			rm -f rBOLDt.nii
+
+			depth=5
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.667)*step(0.833-b)*step(c)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOt.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDt.nii -overwrite 
+			3dcalc -prefix rVASOs.nii -a rVASOs.nii -b rVASOt.nii -expr 'a+b' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLDs.nii -b rBOLDt.nii -expr 'a+b' -overwrite
+			rm -f tempROI.nii
+			rm -f rVASOt.nii
+			rm -f rBOLDt.nii
+
+			depth=6
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.833)*step(1-b)*step(c)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOt.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDt.nii -overwrite 
+			3dcalc -prefix rVASOs.nii -a rVASOs.nii -b rVASOt.nii -expr 'a+b' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLDs.nii -b rBOLDt.nii -expr 'a+b' -overwrite
+			rm -f tempROI.nii
+			rm -f rVASOt.nii
+			rm -f rBOLDt.nii
+
+			depth=7
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-1)*step(1.333-b)*step(c)' -overwrite
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rVASO.nii  -prefix rVASOt.nii -overwrite 
+			3dBlurInMask  -quiet  -float  -mask tempROI.nii  -FWHM 6  -input rBOLD.nii  -prefix rBOLDt.nii -overwrite 
+			3dcalc -prefix rVASOs.nii -a rVASOs.nii -b rVASOt.nii -expr 'a+b' -overwrite
+			3dcalc -prefix rBOLDs.nii -a rBOLDs.nii -b rBOLDt.nii -expr 'a+b' -overwrite
+			rm -f tempROI.nii
+			rm -f rVASOt.nii
+			rm -f rBOLDt.nii
+
+			3dcalc -prefix tempROI.nii -a rMask${ss}.${region}.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+			3dmaskdump -xyz -o temp.1D -mask tempROI.nii -noijk rVASO${ss}_mean.depth.nii -overwrite
+			cp  temp.1D  ${output_dir}/${subj}/depth.rROI${ss}.${region}.s${session}.smooth.1D
+			rm -f temp.1D
+
+			3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rVASOs.nii -overwrite
+			cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.VASO${ss}${run}.s${session}.TS.smooth.1D
+			rm -f temp.1D
+			3dmaskdump  -xyz  -o temp.1D  -mask tempROI.nii  -noijk  rBOLDs.nii -overwrite
+			cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.BOLD${ss}${run}.s${session}.TS.smooth.1D
+			rm -f temp.1D
+
+			rm -f rVASO.nii
+			rm -f rBOLD.nii
+			rm -f rVASOs.nii
+			rm -f rBOLDs.nii
+			rm -f temp.1D
+			rm -f tempROI.nii
+		done
+		wait
+	done
+done
+
+
+
+
+##===dump whole ROI whole time series data for reliability test
+analysis_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis'
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/SUMA'
+output_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis/group'
+subjs=('S01' 'S02')
+suffix='volreg'
+ss=''
+whichRegions=('whole' 'ACA' 'MCA' 'PCA')
+runs=(`count -digits 2 1 2`)
+session=1
+for subj in ${subjs[@]} ; do
+for whichRegion in ${whichRegions[@]} ; do
+	for run in ${runs[@]} ; do
+		cd ${input_dir}/${subj}/s${session}
+		mkdir ${output_dir}/${subj}
+		rm -f temp.1D
+
+		3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rVASO.nii  -input ${analysis_dir}/${subj}s${session}/VASO${ss}${run}.${suffix}.nii  -overwrite
+		3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rBOLD.nii  -input ${analysis_dir}/${subj}s${session}/BOLD${ss}${run}.${suffix}.nii  -overwrite
+		# deep WM data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.WMd.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.WMd.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.WMd.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# superficial WM data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.WMs.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.WMs.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.WMs.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# GM depth data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b)*step(1.001-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# CSF data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-1)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.CSF.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.CSF.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# depth data
+		depth=1
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b)*step(0.167-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=2
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.166)*step(0.334-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=3
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.333)*step(0.501-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=4
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.5)*step(0.667-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=5
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.666)*step(0.834-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=6
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.833)*step(1.001-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rVASO.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.VASO${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+		3dmaskave -q -mask tempROI.nii rBOLD.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.BOLD${ss}${run}.s${session}.TS.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+
+		rm -f rVASO.nii
+		rm -f rBOLD.nii
+		rm -f tempROI.nii
+	done
+	wait
+done
+done
+
+
+##===dump ROI tSNR data
+analysis_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis'
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/SUMA'
+output_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis/group'
+subjs=('S01' 'S02')
+whichRegions=('whole' 'ACA' 'MCA' 'PCA')
+ss=''
+session=1
+for subj in ${subjs[@]} ; do
+	cd ${analysis_dir}/${subj}s${session}
+	3dcalc -prefix rm.tmp.nii -a BOLD01.volreg.nii'[0..298]' -b BOLD01.volreg.nii'[1..299]' -expr '(a+b)/2' -overwrite
+	3dTcat -prefix rm.BOLD.nii -overwrite BOLD01.volreg.nii'[0]' rm.tmp.nii
+	3dTcat -prefix rm.VASO.nii -overwrite VASO01.volreg.nii
+	3dcalc -prefix rm.VASOc1.nii -a rm.VASO.nii -b rm.BOLD.nii -expr 'a/b' -overwrite
+	3dcalc -prefix rm.tmp.nii -a BOLD02.volreg.nii'[0..298]' -b BOLD02.volreg.nii'[1..299]' -expr '(a+b)/2' -overwrite
+	3dTcat -prefix rm.BOLD.nii -overwrite BOLD02.volreg.nii'[0]' rm.tmp.nii
+	3dTcat -prefix rm.VASO.nii -overwrite VASO02.volreg.nii
+	3dcalc -prefix rm.VASOc2.nii -a rm.VASO.nii -b rm.BOLD.nii -expr 'a/b' -overwrite
+	3dTcat -prefix rm.VASOc.nii -overwrite rm.VASOc1.nii rm.VASOc2.nii
+	3dTstat -datum float -mean -prefix rm.mean.nii rm.VASOc.nii -overwrite
+	3dTstat -datum float -stdevNOD -prefix rm.std.nii rm.VASOc.nii -overwrite
+	3dcalc -prefix tSNR.VASOc.nii -a rm.mean.nii -b rm.std.nii -expr 'max(min(a/b,100),-100)' -overwrite
+	rm -f rm*
+
+	for whichRegion in ${whichRegions[@]} ; do
+		cd ${input_dir}/${subj}/s${session}
+		mkdir ${output_dir}/${subj}
+		rm -f temp.1D
+
+		3dresample  -master rVASO${ss}_mean.nii  -rmode NN  -prefix rtSNR.nii  -input ${analysis_dir}/${subj}s${session}/tSNR.VASOc.nii  -overwrite
+		# deep WM data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.WMd.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.WMd.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# superficial WM data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.WMs.nii -b rMask.${whichRegion}.nii -expr 'step(a)*step(b)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.WMs.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# CSF data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-1)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.CSF.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# GM data
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b)*step(1.001-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		# depth data
+		depth=1
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b)*step(0.167-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=2
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.166)*step(0.334-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=3
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.333)*step(0.501-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=4
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.5)*step(0.667-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=5
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.666)*step(0.834-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		depth=6
+		3dcalc -prefix tempROI.nii -a rMask${ss}.GMCSF.nii -b rVASO${ss}_mean.depth.nii -c rMask.${whichRegion}.nii -expr 'step(a)*step(b-0.833)*step(1.001-b)*step(c)' -overwrite
+		3dmaskave -q -mask tempROI.nii rtSNR.nii > temp.1D
+		cp  temp.1D  ${output_dir}/${subj}/rROI.GM${depth}.tSNR.s${session}.${whichRegion}Mean.1D
+		rm -f temp.1D
+
+		rm -f rtSNR.nii
+		rm -f tempROI.nii
+	done
+done
+wait
+
+
+
+#############################################################################
+#########===========undump data after matlab anlaysis=============###########
+#############################################################################
+##===Undump data for mvPI maps
+regions=('WMs' 'WMd' 'GMCSF')
+analysis_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023'
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis/group'
+subjs=('S01' 'S02')
+ss=''
+session=1
+suffix='.rCBV'
+for subj in ${subjs[@]} ; do
+	cd ${analysis_dir}/SUMA/${subj}/s${session}
+	rm -f temp.1D
+	3dUndump -master rVASO${ss}_mean.nii  -xyz  -datum float  -prefix VesselCompliance_WMd${suffix}.nii  ${input_dir}/${subj}/Undump.rROI.whole.WMd.compliance${suffix}.1D  -overwrite
+	3dUndump -master rVASO${ss}_mean.nii  -xyz  -datum float  -prefix VesselCompliance_WMs${suffix}.nii  ${input_dir}/${subj}/Undump.rROI.whole.WMs.compliance${suffix}.1D  -overwrite
+	3dUndump -master rVASO${ss}_mean.nii  -xyz  -datum float  -prefix VesselCompliance_GMCSF${suffix}.nii  ${input_dir}/${subj}/Undump.rROI.whole.GMCSF.compliance${suffix}.1D  -overwrite
+
+	3dcalc -prefix PIMaps${suffix}.nii -a VesselCompliance_WMd${suffix}.nii -b rMask${ss}.WMd.nii  \
+	                 -c VesselCompliance_WMs${suffix}.nii -d rMask${ss}.WMs.nii  \
+					 -e VesselCompliance_GMCSF${suffix}.nii -f rMask${ss}.GMCSF.nii  \
+					 -expr 'a*step(b)+c*step(d)+e*step(f)' -overwrite
+done
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#############################################################################
+#########========connect afni and suma for CBF session============###########
+#############################################################################
+subj=S01
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/SUMA'
+cd ${input_dir}/${subj}/CBF
+
+3dresample  -dxyz 0.625 0.625 0.625   -rmode Cu  -prefix rcontrol.nii  -input control.nii  -overwrite
+
+##===Cut off some cavities to speed up the calculation
+3dcalc -prefix rcontrol.nii -a rcontrol.nii -expr 'a*step(80-x)*step(x+80)*step(y+90)*step(100-y)*step(65-z)' -overwrite
+3dAutobox -prefix rcontrol.nii -input rcontrol.nii -noclust -overwrite
+3dresample  -master rcontrol.nii   -rmode NN  -prefix rCBF.nii  -input CBF.nii  -overwrite
+3dresample  -master rcontrol.nii   -rmode NN  -prefix T1.resample.nii  -input T1_al.nii  -overwrite
+
+
+mripy_align_S2E.ipy -b T1_al.nii  -s ../SUMAhd  -o ${subj}_SurfVol_Alnd_Exp.nii
+# depth 0->1 = deep->superficial
+mripy_compute_depth.ipy -b rcontrol.nii  -s ../SUMAhd -v ${subj}_SurfVol_Alnd_Exp.nii -l L14
+
+
+# before S23 and S23
+for hemi in lh rh ; do
+	3dSurf2Vol  -spec ../SUMA/std.141.${subj}_${hemi}.spec \
+				-surf_A std.141.${hemi}.smoothwm.asc \
+				-surf_B std.141.${hemi}.pial.asc \
+				-sv  ${subj}_SurfVol_Alnd_Exp.nii  \
+				-gridparent  control.flip.nii  \
+				-map_func max  \
+				-f_index points  \
+				-f_steps 10      \
+				-f_p1_fr -0.4 -f_pn_fr 0.4   \
+				-sdata ../../std.141.HCP-MMP1.${hemi}.HCP-MMP1.annot.niml.dset   \
+				-prefix Mask.${hemi}.HCP-MMP1.annot.nii   \
+				-overwrite
+done
+# S24-28
+for hemi in lh rh ; do
+	3dSurf2Vol  -spec ../SUMA/std.141.${subj}_${hemi}.spec \
+				-surf_A std.141.${hemi}.smoothwm.asc \
+				-surf_B std.141.${hemi}.pial.asc \
+				-sv  ${subj}_SurfVol_Alnd_Exp.nii  \
+				-gridparent  T1_al.nii  \
+				-map_func max  \
+				-f_index points  \
+				-f_steps 10      \
+				-f_p1_fr -0.4 -f_pn_fr 0.4   \
+				-sdata ../../std.141.HCP-MMP1.${hemi}.HCP-MMP1.annot.niml.dset   \
+				-prefix Mask.${hemi}.HCP-MMP1.annot.nii   \
+				-overwrite
+done
+3dcalc -prefix Mask.HCP-MMP1.annot.nii -a Mask.lh.HCP-MMP1.annot.nii -b Mask.rh.HCP-MMP1.annot.nii -expr 'step(-a+0.1)*step(b)*b+step(-b+0.1)*step(a)*a' -overwrite
+rm -f Mask.*.HCP-MMP1.annot.nii
+3dresample  -master rcontrol.nii   -rmode NN  -prefix rMask.HCP-MMP1.annot.nii  -input Mask.HCP-MMP1.annot.nii  -overwrite
+
+
+
+##===get ACA/MCA/PCA mask
+3dcalc -prefix tempACA.nii -a ../../../reference/VascularTerritoriesTemplate/mni_vascular_territories.nii.gz -expr 'step(a-1.9)*step(2.1-a)+step(a-11.9)*step(12.1-a)' -overwrite
+3dcalc -prefix tempMCA.nii -a ../../../reference/VascularTerritoriesTemplate/mni_vascular_territories.nii.gz -expr 'step(a-3.9)*step(4.1-a)+step(a-13.9)*step(14.1-a)' -overwrite
+3dcalc -prefix tempPCA.nii -a ../../../reference/VascularTerritoriesTemplate/mni_vascular_territories.nii.gz -expr 'step(a-5.9)*step(6.1-a)+step(a-15.9)*step(16.1-a)' -overwrite
+for vascularM in ACA MCA PCA ; do
+	3dNwarpApply -master rcontrol.nii \
+				-source temp${vascularM}.nii \
+				-interp wsinc5 \
+				-iwarp -nwarp "T1warp_whole_1Warp.nii.gz antsAffine_whole.1D" \
+				-prefix temp.nii -overwrite
+	3dcalc -prefix rMask.${vascularM}.nii -a temp.nii -expr 'step(a-0.5)' -overwrite
+	rm -f temp.nii
+	rm -f temp${vascularM}.nii
+done
+wait
+3dcalc -prefix rMask.VasTer.nii -a rMask.ACA.nii -b rMask.MCA.nii -c rMask.PCA.nii -expr 'a+b*2+c*3' -overwrite
+
+
+
+##===segment the WM
+3dSeg -anat ${subj}_SurfVol_Alnd_Exp.nii -mask AUTO -classes 'CSF; GM; WM' -prefix Seg_T1
+3dcopy Seg_T1/Classes+orig. Segment.nii
+3dresample  -master rcontrol.nii   -rmode NN  -prefix rsegment.nii  -input segment.nii  -overwrite
+
+3dcalc -prefix rWM.nii -a rsegment.nii -expr 'step(a-2.8)' -overwrite
+3dcalc -prefix rMask.GMCSF.nii -a rcontrol.depth.nii -expr 'step(a)' -overwrite
+
+3dcalc -prefix rWM.nii -a rWM.nii -b rcontrol.depth.nii -expr 'step(a)*step(0.001-b)' -overwrite
+
+# Check and remove incorrect clusters in AFNI GUI, then save as file 'rWMc_mask+orig'
+3dAFNItoNIFTI -prefix rWMc  rWMc_mask+orig. -overwrite
+3dcalc -prefix tempCortex.nii -a ../../../reference/VascularTerritoriesTemplate/cortex_mask.nii -expr 'step(a)' -overwrite
+3dNwarpApply -master rcontrol.nii \
+			-source tempCortex.nii \
+			-interp wsinc5 \
+			-iwarp -nwarp "T1warp_whole_1Warp.nii.gz antsAffine_whole.1D" \
+			-prefix Cortex_mask.nii -overwrite
+3dcalc -prefix Cortex_mask.nii -a Cortex_mask.nii -expr 'step(a-0.5)' -overwrite
+rm -f tempCortex.nii
+3dcalc -prefix rMask.WMs.nii -a rWMc.nii -b rMask.HCP-MMP1.annot.nii -c Cortex_mask.nii -expr 'step(a)*step(b)*step(c)' -overwrite
+3dcalc -prefix rMask.WMd.nii -a rWMc.nii -b rMask.HCP-MMP1.annot.nii -c Cortex_mask.nii -expr 'step(a)*step(0.1-b)*step(c)' -overwrite
+
+
+
+##===dump data to compute the laminar profile of CBF
+regions=('WMs' 'WMd' 'GMCSF')
+input_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/SUMA'
+output_dir='/Users/guofanhua/Desktop/gfh/work/experiment/VASO_pulsatility2023/analysis/group'
+subjs=('S01' 'S02')
+ss=''
+for subj in ${subjs[@]} ; do
+	cd ${input_dir}/${subj}/CBF
+	mkdir ${output_dir}/${subj}
+	rm -f temp.1D
+	for region in ${regions[@]} ; do		
+		3dmaskdump  -xyz  -o temp.1D  -mask rMask${ss}.${region}.nii  -noijk  rCBF.nii -overwrite
+		cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.CBF${ss}.TS.1D
+		rm -f temp.1D
+
+		3dmaskdump -xyz -o temp.1D -mask rMask${ss}.${region}.nii -noijk rMask.VasTer.nii -overwrite
+		cp  temp.1D  ${output_dir}/${subj}/rROI.${region}.CBF${ss}.VTmask.1D
+		rm -f temp.1D
+
+		3dmaskdump -xyz -o temp.1D -mask rMask${ss}.${region}.nii -noijk rcontrol.depth.nii -overwrite
+		cp  temp.1D  ${output_dir}/${subj}/depth.rROI${ss}.${region}.CBF.1D
+		rm -f temp.1D
+	done
+done
+
+
+
+
+
+
+
+
+
